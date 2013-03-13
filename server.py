@@ -8,26 +8,49 @@ import struct
 from gearman import protocol
 from gearman.job import GearmanJob, GearmanJobRequest
 
+from Queue import Queue
 from collections import defaultdict
 
-#worker已注册的任务
-#{'echo':[work1, worker2]}
-register_tasks = defaultdict(list)
+class Dispatcher(object):
+    def __init__(self):
+        self.register_tasks = defaultdict(list)
+        self.request_task = defaultdict(Queue)
+    
+    def push_request(self, request, task):
+        self.request_task[task].put(request)
+        
+    def unregister_task(self, task, worker):
+        self.register_tasks[task].remove(worker)
+    
+    def register_task(self, task, worker):
+        self.register_tasks[task].append(worker)
+    
+    def dispatch(self, request,task):
+        workers  = self.register_tasks[task]
+        for worker in workers:
+            if worker.status == 0:
+                worker.noop(request)
+                return
+        self.push_request(request,task)
 
-
-#client请求request dict
-#{'H:lap:1':req1}
-request_dict = {}
-
-#client请求request list
-#{req1, req2, req3}
-#request_task = []
-request_task = defaultdict(list)
-
+    def dispatch_worker(self, worker):
+        for task in worker.tasks:
+            self.dispatch_worker_task(worker, task)
+    
+    def dispatch_worker_task(self, worker, task):
+        try:
+            request = self.request_task[task].get_nowait()
+        except:
+            return
+        
+        if worker.status == 0:
+            worker.noop(request)
+    
 class Connection(object):
-    def __init__(self, stream, address):
+    def __init__(self, stream, address, dispatcher):
         #status 0 空闲  1 忙
         self.status = 0
+        self.dispatcher = dispatcher
         self.tasks = []
         self.request = None
         self._incoming_buffer = ''
@@ -36,7 +59,10 @@ class Connection(object):
         self._stream.set_close_callback(self.on_close)        
         self.read_command()
         print address, "A new connection has entered."
-   
+
+    def isbusy(self):
+        return status
+    
     def read_command(self):
         self._stream.read_bytes(protocol.COMMAND_HEADER_SIZE, self.read_command_arg)
 
@@ -48,7 +74,7 @@ class Connection(object):
     def execute_command(self, buf):
         self._incoming_buffer += buf
         cmd_type, cmd_args, cmd_len = protocol.parse_binary_command(self._incoming_buffer, False)
-        print cmd_type, cmd_args, cmd_len
+        print protocol.get_command_name(cmd_type), cmd_args, cmd_len
        
         gearman_command_name = protocol.get_command_name(cmd_type)
         recv_command_function_name = gearman_command_name.lower().replace('gearman_command_', 'recv_')
@@ -67,93 +93,21 @@ class Connection(object):
         self.read_command()
    
     def on_close(self):
+        for task in self.tasks:            
+            #register_tasks[task].remove(self)
+            self.dispatcher.unregister_task(task, self)
+            
+        #
+        #GEARMAN_COMMAND_WORK_FAIL 14
+        if self.request:
+            client = self.request.gearman_job.connection
+            client.work_fail(self.request.gearman_job.handle)
         print self._address, "A user has left."
     
-    def recv_reset_abilities(self):
-        print "reset_abilities"
     
-    def recv_can_do(self, task):
-        """Worker -> Job Server worker向server注册task"""
-        print task
-        self.tasks.append(task)
-        register_tasks[task].append(self)
-        if not self.request:
-            self.grab_job()
-        
-
     def grab_job(self):
-        for task in self.tasks:
-            print "aaaa"
-            if request_task[task]:
-                print len(request_task[task])
-                if len(request_task[task]) > 0:
-                    request = request_task[task].pop()
-                    #request_task[task].remove(request)
-                    self.request = request
-                    if self.status == 0:
-                        self.noop(request)
-                    break;
+        self.dispatcher.dispatch_worker(self)
 
-    def recv_grab_job_uniq(self):
-        """Worker -> Job Server work向server请求task"""
-        print "recv_grab_job_uniq"
-        #requests = request_task['reverse']
-        #if requests:
-        #    req = requests[0]
-        #    job = req.gearman_job
-        #    #self.job_assign(job.handle, job.task, job.data)
-        #    print "job.task:", job.handle, job.task, job.unique, job.data
-        #    self.job_assign_uniq(job.handle, job.task, job.unique, job.data)
-        #    self.status = 1
-        #    requests.remove(req)
-        #else:
-        #    self.no_job()
-        if not self.request:
-            self.grab_job()
-            
-        if self.request:
-            job = self.request.gearman_job
-            #self.job_assign(job.handle, job.task, job.data)
-            print "job.task:", job.handle, job.task, job.unique, job.data
-            self.job_assign_uniq(job.handle, job.task, job.unique, job.data)
-            self.status = 1
-        else:
-            self.no_job()
-    
-    def recv_pre_sleep(self):
-        """Worker -> Job Server worker通知server worker产将进入休眠状态"""
-        self.status = 0
-       
-    def recv_work_complete(self, job_handle, data):
-        """Worker -> Job Server worker通知server worker和任务执行完毕, 回传任务结果"""
-        #req = request_dict[job_handle]
-        #req.result = data
-        req = self.request
-        req.result = data
-        
-        client_connection = req.gearman_job.connection
-        client_connection.work_complete(job_handle, data)
-
-    def recv_submit_job(self, task, unique, data):
-        """Client -> Job Server """
-        handle = 'H:lap:1'
-        job = GearmanJob(self, handle, task, unique, data)
-        request = GearmanJobRequest(job)
-        #request_dict[handle] = request
-        request_task[task].append(request)
-        
-        self.job_created(handle)
-        
-        #worker_connection  = register_tasks[task][0]
-        #worker_connection.noop()
-        
-        #
-        workers  = register_tasks[task]
-        for worker in workers:
-            if worker.status == 0:
-                worker.noop(request)
-                break
-    
     def no_job(self):
         """Job Server -> Worker"""
         data = protocol.pack_binary_command(protocol.GEARMAN_COMMAND_NO_JOB, {}, True)
@@ -173,7 +127,6 @@ class Connection(object):
     def job_assign_uniq(self, job_handle, task, unique, data):
         """Job Server -> Worker"""
         buf = protocol.pack_binary_command(protocol.GEARMAN_COMMAND_JOB_ASSIGN_UNIQ, {'job_handle':job_handle, 'task':task, 'unique':unique, 'data':data}, True)
-        print "buf:", buf
         self._stream.write(buf)
 
     def job_created(self, job_handle):
@@ -186,11 +139,65 @@ class Connection(object):
         buf = protocol.pack_binary_command(protocol.GEARMAN_COMMAND_WORK_COMPLETE, {'job_handle':job_handle, 'data':data}, True)
         self._stream.write(buf)
         #del request_dict[job_handle]
+        
+    def work_fail(self, job_handle):
+        """Job Server -> Client"""
+        buf = protocol.pack_binary_command(protocol.GEARMAN_COMMAND_WORK_FAIL, {'job_handle':job_handle}, True)
+        self._stream.write(buf)
+
+
+
+    def recv_reset_abilities(self):
+        pass
     
+    def recv_can_do(self, task):
+        """Worker -> Job Server worker向server注册task"""
+        self.tasks.append(task)
+        #register_tasks[task].append(self)
+        self.dispatcher.register_task(task, self)
+        if not self.request:
+            self.grab_job()
+        
+
+    def recv_grab_job_uniq(self):
+        """Worker -> Job Server work向server请求task"""
+        if not self.request:
+            self.grab_job()
+            
+        if self.request:
+            job = self.request.gearman_job
+            self.job_assign_uniq(job.handle, job.task, job.unique, job.data)
+            self.status = 1
+        else:
+            self.no_job()
+    
+    def recv_pre_sleep(self):
+        """Worker -> Job Server worker通知server worker产将进入休眠状态"""
+        self.status = 0
+       
+    def recv_work_complete(self, job_handle, data):
+        """Worker -> Job Server worker通知server worker和任务执行完毕, 回传任务结果"""
+        #req = self.request
+        #req.result = data
+        
+        client_connection = self.request.gearman_job.connection
+        client_connection.work_complete(job_handle, data)
+        self.request = None
+
+    def recv_submit_job(self, task, unique, data):
+        """Client -> Job Server """
+        handle = 'H:lap:1'
+        job = GearmanJob(self, handle, task, unique, data)
+        request = GearmanJobRequest(job)
+        self.job_created(handle)
+        
+        self.dispatcher.dispatch(request, task)
+
+dispatcher = Dispatcher()    
 
 class GearmanServer(TCPServer):
     def handle_stream(self, stream, address):       
-        Connection(stream, address)
+        Connection(stream, address, dispatcher)
 
 if __name__ == '__main__':
     print "begin..."

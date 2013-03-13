@@ -9,4 +9,5 @@ def reverse(gearman_worker, job):
 
 worker = GearmanWorker(['localhost:8000'])
 worker.register_task("reverse", reverse)
+worker.register_task("echotime", echotime)
 worker.work()
